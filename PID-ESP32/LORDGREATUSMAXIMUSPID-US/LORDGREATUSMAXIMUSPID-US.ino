@@ -1,0 +1,310 @@
+/*
+ * MASTER CONTROLLER - ESP32-S3-N16R8
+ * Features:
+ * - Dual-core tasks: Core0 WiFi, Core1 Sensors + Navigation
+ * - Kalman filter with slip detection (FL + RR only)
+ * - PID waypoint navigation (first 60s), then teleop via WiFi
+ * - Elevator safety limits (EL + ER encoders)
+ * - UART communication with slave board
+ * - Debug mode switch via serial commands
+ * - Debug toggles for RPM and ultrasonic sensors
+ */
+
+#include <Arduino.h>
+#include <Wire.h>
+#include "MPU6050.h"
+#include <BasicLinearAlgebra.h>
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <algorithm>
+
+using namespace BLA;
+
+// ================= USER CONFIG =================
+const char* ssid = "Fox-17";
+const char* password = "Kyra2bin9";
+const int localPort = 4210;
+const unsigned long AUTONOMOUS_DURATION = 0; // 60s
+
+// Waypoints (X cm, Y cm)
+struct Waypoint { float x; float y; };
+Waypoint waypoints[] = {
+  {0,0}, {100,0}, {0,0}
+};
+int waypointCount = sizeof(waypoints)/sizeof(Waypoint);
+int currentWaypoint = 0;
+
+// ================= PIN DEFINITIONS =================
+// Chassis encoders (only FL and RR)
+#define FL_A 6
+#define FL_B 7
+#define RR_A 4
+#define RR_B 5
+
+// Elevator encoders
+#define EL_A 8
+#define EL_B 9
+#define ER_A 10
+#define ER_B 11
+
+// Ultrasonics
+#define TRIG_PIN 14
+#define ECHO_FRONT 15
+#define ECHO_RIGHT 16
+#define ECHO_LEFT 17
+#define ECHO_REAR 18
+
+// I2C & UART
+#define SDA_PIN 41
+#define SCL_PIN 42
+#define RX_PIN 47
+#define TX_PIN 20
+
+// ================= CONSTANTS =================
+const float WHEEL_CIRCUMFERENCE = 31.4;
+const int TICKS_PER_REV = 48;
+const float TICK_TO_CM = WHEEL_CIRCUMFERENCE / TICKS_PER_REV;
+const float WHEELBASE = 31.75;
+const float GYRO_SCALE = 131.0;
+const float GYRO_OFFSET = -110.0;
+const int ELEVATOR_MAX_PULSES = 1000;
+const int ELEVATOR_MIN_PULSES = 0;
+
+// ================= STATE VARIABLES =================
+volatile long cntFL=0, cntRR=0;
+volatile long cntEL=0, cntER=0;
+unsigned long startTime;
+bool isAutonomous = true;
+
+// WiFi
+WiFiUDP udp;
+char packetBuffer[255];
+
+// Teleop inputs
+float axis0=0, axis2=0, axis4=0, axis5=0;
+int btn6=0, btn12=0, btn13=0;
+
+// Kalman state
+BLA::Matrix<5,1> X = {0,0,0,0,0};
+
+// Debug mode flags
+bool debugMode=false, showRPM=false, showUltrasonic=false;
+
+// ================= ISRs =================
+void IRAM_ATTR isrFL(){ if(digitalRead(FL_A)==digitalRead(FL_B)) cntFL++; else cntFL--; }
+void IRAM_ATTR isrRR(){ if(digitalRead(RR_A)==digitalRead(RR_B)) cntRR++; else cntRR--; }
+void IRAM_ATTR isrEL(){ if(digitalRead(EL_A)==digitalRead(EL_B)) cntEL++; else cntEL--; }
+void IRAM_ATTR isrER(){ if(digitalRead(ER_A)==digitalRead(ER_B)) cntER++; else cntER--; }
+
+// ================= FUNCTIONS =================
+float calcRPM(long pulses){ return (pulses/(float)TICKS_PER_REV)*60.0; }
+
+long readHCSR(int echoPin){
+  digitalWrite(TRIG_PIN,LOW); delayMicroseconds(2);
+  digitalWrite(TRIG_PIN,HIGH); delayMicroseconds(10);
+  digitalWrite(TRIG_PIN,LOW);
+  long duration=pulseIn(echoPin,HIGH,30000);
+  if(duration==0) return -1;
+  return duration*0.034/2;
+}
+
+float medianFilterUltrasonic(int echoPin){
+  float vals[5];
+  for(int i=0;i<5;i++){ vals[i]=readHCSR(echoPin); delay(5); }
+  std::sort(vals,vals+5);
+  return vals[2];
+}
+
+void sendToSlave(float f,float s,float t,int servo,int el_up,int el_down){
+  Serial2.printf("MOV %.2f,%.2f,%.2f,%d,%d,%d\n",f,s,t,servo,el_up,el_down);
+  Serial.printf("[OUT] f=%.2f s=%.2f t=%.2f | servo=%d el_up=%d el_down=%d\n",
+                f,s,t,servo,el_up,el_down);
+}
+
+// Kalman prediction using only FL and RR
+void kalmanPredict(float dt,int16_t gz,long FL,long RR){
+  float dL=(FL*TICK_TO_CM);
+  float dR=(RR*TICK_TO_CM);
+  float d=(dL+dR)/2.0;
+  float dTheta=(dR-dL)/WHEELBASE;
+
+  if(abs(dL-dR)>10.0){
+    dTheta=((gz-GYRO_OFFSET)/GYRO_SCALE)*(PI/180.0)*dt;
+  }
+
+  float gyroZ=(gz-GYRO_OFFSET)/GYRO_SCALE;
+  float gyroZ_rad=gyroZ*(PI/180.0);
+
+  X(0)+=d*cos(X(2));
+  X(1)+=d*sin(X(2));
+  X(2)+=dTheta+gyroZ_rad*dt;
+  X(3)=d/dt;
+  X(4)=gyroZ_rad;
+}
+
+// Navigation PID
+void navigationToPID(float tx,float ty){
+  float ex=tx-X(0), ey=ty-X(1);
+  float dist=sqrt(ex*ex+ey*ey);
+  float desired=atan2(ey,ex);
+  float angleErr=desired-X(2);
+  while(angleErr>PI) angleErr-=2*PI;
+  while(angleErr<-PI) angleErr+=2*PI;
+
+  float f=0.02*dist;
+  float t=0.5*angleErr;
+  f=constrain(f,-1.0,1.0);
+  t=constrain(t,-1.0,1.0);
+
+  sendToSlave(f,0,t,btn6,btn13,btn12);
+}
+
+// ================= TASKS =================
+void TaskWiFi(void*){
+  WiFi.begin(ssid,password);
+  while(WiFi.status()!=WL_CONNECTED){ delay(500); }
+  udp.begin(localPort);
+  Serial.
+  while(true){
+    int packetSize=udp.parsePacket();
+    if(packetSize){
+      int len=udp.read(packetBuffer,255);
+      if(len>0) packetBuffer[len]=0;
+      String msg(packetBuffer);
+
+      if(msg.startsWith("AXIS")){
+        int id=msg.substring(5,6).toInt();
+        float val=msg.substring(7).toFloat();
+        if(id==0) axis0=val;
+        if(id==2) axis2=val;
+        if(id==4) axis4=val;
+        if(id==5) axis5=val;
+        Serial.printf("[UDP] Axis %d = %.2f\n", id, val);
+      }
+      if(msg.startsWith("BUTTON")){
+        int id=msg.substring(7,9).toInt();
+        int val=msg.substring(10).toInt();
+        if(id==6) btn6=val;
+        if(id==12) btn12=val;
+        if(id==13) btn13=val;
+        Serial.printf("[UDP] Button %d = %d\n", id, val);
+      }
+    }
+    vTaskDelay(10/portTICK_PERIOD_MS);
+  }
+}
+
+// ================= SETUP =================
+MPU6050 mpu;
+void setup(){
+  Serial.begin(115200);
+  Serial2.begin(115200,SERIAL_8N1,RX_PIN,TX_PIN);
+
+  pinMode(FL_A,INPUT); pinMode(FL_B,INPUT);
+  pinMode(RR_A,INPUT); pinMode(RR_B,INPUT);
+  attachInterrupt(digitalPinToInterrupt(FL_A), isrFL, RISING);
+  attachInterrupt(digitalPinToInterrupt(RR_A), isrRR, RISING);
+
+  pinMode(EL_A,INPUT); pinMode(EL_B,INPUT);
+  pinMode(ER_A,INPUT); pinMode(ER_B,INPUT);
+  attachInterrupt(digitalPinToInterrupt(EL_A), isrEL, RISING);
+  attachInterrupt(digitalPinToInterrupt(ER_A), isrER, RISING);
+
+  pinMode(TRIG_PIN,OUTPUT);
+  pinMode(ECHO_FRONT,INPUT);
+   pinMode(ECHO_REAR,INPUT);
+
+  Wire.begin(SDA_PIN,SCL_PIN);
+  mpu.initialize();
+
+  // Start WiFi task on Core0
+  xTaskCreatePinnedToCore(TaskWiFi,"WiFiTask",8192,NULL,1,NULL,0);
+
+  Serial.println("MASTER CONTROLLER READY");
+  startTime=millis();
+}
+
+void loop(){
+  static unsigned long lastLoop=0;
+  unsigned long now=millis();
+  float dt=(now-lastLoop)/1000.0;
+  if(dt<0.01){ delay(1); return; }
+  lastLoop=now;
+
+  // === SERIAL COMMAND PARSING ===
+  if(Serial.available()){
+    String cmd=Serial.readStringUntil('\n');
+    cmd.trim();
+    if(cmd.equalsIgnoreCase("DEBUGON")){ debugMode=true; Serial.println("Debugging mode enabled"); }
+    else if(cmd.equalsIgnoreCase("DEBUGOFF")){ debugMode=false; Serial.println("Normal robot loop enabled"); }
+    else if(cmd.equalsIgnoreCase("RPMON")) showRPM=true;
+    else if(cmd.equalsIgnoreCase("RPMOFF")) showRPM=false;
+    else if(cmd.equalsIgnoreCase("USON")) showUltrasonic=true;
+    else if(cmd.equalsIgnoreCase("USOFF")) showUltrasonic=false;
+  }
+
+  // === DEBUG MODE ===
+  if(debugMode){
+    if(showRPM){
+      Serial.printf("RPM FL=%.1f RR=%.1f | Elevator EL=%ld ER=%ld\n",
+        calcRPM(cntFL), calcRPM(cntRR), cntEL, cntER);
+    }
+    if(showUltrasonic){
+      Serial.printf("US Front=%.1f Right=%.1f Left=%.1f Rear=%.1f\n",
+        medianFilterUltrasonic(ECHO_FRONT),
+        medianFilterUltrasonic(ECHO_RIGHT),
+        medianFilterUltrasonic(ECHO_LEFT),
+        medianFilterUltrasonic(ECHO_REAR));
+    }
+    delay(500); // slower loop for readability
+    return; // skip control loop while debugging
+  }
+
+  // === NORMAL ROBOT LOOP ===
+  int16_t gx, gy, gz;
+  mpu.getRotation(&gx,&gy,&gz);
+
+  if (abs(gz - GYRO_OFFSET) < 65) {
+    gz = GYRO_OFFSET;
+  }
+  
+  // Kalman prediction with only FL and RR
+  kalmanPredict(dt, gz, cntFL, cntRR);
+  cntFL = cntRR = 0; // reset after use
+  Serial.printf("[STATE] Pos=(%.1f, %.1f) Heading=%.2f rad Vel=%.2f cm/s\n",
+              X(0), X(1), X(2), X(3));
+
+  // Mode switch timing
+  if(now - startTime > AUTONOMOUS_DURATION) isAutonomous = false;
+
+  if(isAutonomous){
+    // Autonomous PID navigation
+    if(currentWaypoint < waypointCount){
+      navigationToPID(waypoints[currentWaypoint].x, waypoints[currentWaypoint].y);
+      float dx = waypoints[currentWaypoint].x - X(0);
+      float dy = waypoints[currentWaypoint].y - X(1);
+      if(sqrt(dx*dx + dy*dy) < 5.0) currentWaypoint++;
+    } else {
+      sendToSlave(0,0,0,btn6,0,0); // stop
+    }
+  } else {
+    // Teleop mode (priority chain: forward/back > strafe > turn)
+    float f=0, s=0, t=0;
+    if(axis4 > 0.1) { f = 1.0; }
+    else if(axis5 > 0.1) { f = -1.0; }
+    else if(abs(axis0) > 0.1) { s = axis0; }
+    else if(abs(axis2) > 0.1) { t = axis2; }
+    else { f = s = t = 0; }
+
+    // Elevator safety with encoders
+    int el_up = 0, el_down = 0;
+    if(btn13 == 1 && cntEL < ELEVATOR_MAX_PULSES) el_up = 1;
+    if(btn12 == 1 && cntER > ELEVATOR_MIN_PULSES) el_down = 1;
+
+    sendToSlave(f, s, t, btn6, el_up, el_down);
+  }
+
+  delay(20); // ~50Hz loop
+}
