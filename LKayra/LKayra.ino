@@ -1,8 +1,8 @@
 // 192.168.4.1
 // MECHATAK - Final versiyon kodu
 
-#define PROBOT_WIFI_AP_PASSWORD "kayra123"
-#define PROBOT_WIFI_AP_SSID "MECHATAK"
+#define PROBOT_WIFI_AP_PASSWORD "ATAKFL"
+#define PROBOT_WIFI_AP_SSID "ATAKFL"
 #define PROBOT_WIFI_AP_CHANNEL 9
 
 #include <ESP32Servo.h> // Use the ESP32-specific library
